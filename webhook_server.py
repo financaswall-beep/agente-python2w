@@ -279,15 +279,18 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
     # 2. Filtrar: processar eventos de mensagem recebida do Chatwoot
     event = data.get("event")
     if event not in {"message_created", "message_incoming"}:
+        logger.info("Webhook ignorado: event=%s", event)
         return {"status": "ignored", "event": event}
 
     # 3. Filtrar: so processar mensagens incoming (do cliente)
     message_type = data.get("message_type")
     if message_type not in (0, "incoming"):
+        logger.info("Webhook ignorado: message_type=%s", message_type)
         return {"status": "ignored", "reason": "not_incoming"}
 
     # 4. Ignorar mensagens privadas (notas internas)
     if data.get("private", False):
+        logger.info("Webhook ignorado: mensagem privada")
         return {"status": "ignored", "reason": "private"}
 
     # 5. Extrair dados basicos
@@ -307,6 +310,11 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
 
     # 7. Filtrar por inbox (opcional)
     if CHATWOOT_INBOX_ID and str(inbox_id) != str(CHATWOOT_INBOX_ID):
+        logger.info(
+            "Webhook ignorado: inbox_id=%s esperado=%s",
+            inbox_id,
+            CHATWOOT_INBOX_ID,
+        )
         return {"status": "ignored", "reason": "wrong_inbox"}
 
     # 8. Extrair telefone — varios locais possiveis
