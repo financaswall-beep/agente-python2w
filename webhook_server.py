@@ -261,7 +261,7 @@ async def health():
 
 @app.post("/webhook/chatwoot")
 async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Recebe webhooks do Chatwoot (evento message_created)."""
+    """Recebe webhooks do Chatwoot para mensagens recebidas."""
 
     # 1. Validar assinatura HMAC
     body = await request.body()
@@ -272,9 +272,9 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
 
     data = await request.json()
 
-    # 2. Filtrar: so processar message_created
+    # 2. Filtrar: processar eventos de mensagem recebida do Chatwoot
     event = data.get("event")
-    if event != "message_created":
+    if event not in {"message_created", "message_incoming"}:
         return {"status": "ignored", "event": event}
 
     # 3. Filtrar: so processar mensagens incoming (do cliente)
@@ -290,7 +290,7 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
     content = (data.get("content") or "").strip()
     conversation = data.get("conversation", {})
     conversation_id = conversation.get("id")
-    inbox_id = conversation.get("inbox_id")
+    inbox_id = conversation.get("inbox_id") or data.get("inbox", {}).get("id")
     sender = data.get("sender", {})
     sender_meta = conversation.get("meta", {}).get("sender", {})
 
