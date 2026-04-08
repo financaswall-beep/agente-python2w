@@ -128,12 +128,15 @@ def _extrair_telefone_do_identifier(identifier: str) -> str:
     return identifier.split("@")[0]
 
 
-def _verificar_assinatura(body: bytes, signature: str) -> bool:
-    """Valida HMAC-SHA256 do webhook (se secret configurado)."""
+def _verificar_assinatura(body: bytes, timestamp: str, signature: str) -> bool:
+    """Valida HMAC-SHA256 do webhook no formato do Chatwoot."""
     if not CHATWOOT_WEBHOOK_SECRET:
         return True
-    expected = hmac.new(
-        CHATWOOT_WEBHOOK_SECRET.encode(), body, hashlib.sha256
+    if not timestamp or not signature:
+        return False
+    message = f"{timestamp}.".encode() + body
+    expected = "sha256=" + hmac.new(
+        CHATWOOT_WEBHOOK_SECRET.encode(), message, hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
 
@@ -266,7 +269,8 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
     # 1. Validar assinatura HMAC
     body = await request.body()
     signature = request.headers.get("x-chatwoot-signature", "")
-    if CHATWOOT_WEBHOOK_SECRET and not _verificar_assinatura(body, signature):
+    timestamp = request.headers.get("x-chatwoot-timestamp", "")
+    if CHATWOOT_WEBHOOK_SECRET and not _verificar_assinatura(body, timestamp, signature):
         logger.warning("Assinatura invalida no webhook")
         raise HTTPException(status_code=401, detail="Assinatura invalida")
 
