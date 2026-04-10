@@ -988,8 +988,16 @@ def processar_turno(
 
     # --- 11. Avaliar transicao de etapa ---
     _avaliar_transicao(sessao_id, contexto.sessao.etapa_atual, envelope.etapa_atual)
-    if chatwoot_conv_id and envelope.etapa_atual != contexto.sessao.etapa_atual:
-        chatwoot_sync.sincronizar_etapa(chatwoot_conv_id, envelope.etapa_atual.value)
+    if chatwoot_conv_id:
+        # Determinar etapa efetiva: se houve transicao valida usa a nova, senao a atual
+        _etapa_antiga = contexto.sessao.etapa_atual
+        _etapa_efetiva = (
+            envelope.etapa_atual
+            if envelope.etapa_atual == _etapa_antiga
+            or transicao_permitida(_etapa_antiga, envelope.etapa_atual)
+            else _etapa_antiga
+        )
+        chatwoot_sync.sincronizar_etapa(chatwoot_conv_id, _etapa_efetiva.value)
 
     # --- 12. Auto-promover em fechamento se pre-condicoes ok ---
     # Se a etapa resultante e fechamento e o promotor nao foi chamado

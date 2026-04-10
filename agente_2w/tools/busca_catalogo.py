@@ -154,11 +154,13 @@ def _parsear_medida(medida: str) -> dict | None:
 def _buscar_catalogo_por_medidas(medidas_web: list[dict]) -> list[dict]:
     """Busca no catálogo pneus que correspondam às medidas descobertas via web.
 
-    Retorna lista de pneus com estoque > 0, enriquecidos com a medida de origem.
+    A primeira medida da lista é tratada como medida original de fábrica.
+    Retorna lista de pneus com estoque > 0, ordenados: medida original
+    primeiro, depois por preço crescente.
     """
     resultados = []
     medidas_ja_buscadas = set()
-    for m in medidas_web:
+    for idx, m in enumerate(medidas_web):
         chave = (m.get("largura"), m.get("perfil"), m.get("aro"))
         if chave in medidas_ja_buscadas:
             continue
@@ -171,8 +173,14 @@ def _buscar_catalogo_por_medidas(medidas_web: list[dict]) -> list[dict]:
         )
         for p in pneus:
             p["origem_medida"] = f"{chave[0]}/{chave[1]}-{chave[2]}"
-            p["medida_alternativa"] = True
+            p["medida_alternativa"] = idx > 0  # primeira medida = original
         resultados.extend(pneus)
+
+    # Ordenar: medida original primeiro, depois por preco crescente
+    resultados.sort(key=lambda p: (
+        p.get("medida_alternativa", True),
+        float(p.get("preco_venda") or 9999),
+    ))
     return resultados
 
 
