@@ -989,6 +989,11 @@ def processar_turno(
 
     # --- 11. Avaliar transicao de etapa ---
     _avaliar_transicao(sessao_id, contexto.sessao.etapa_atual, envelope.etapa_atual)
+    logger.info(
+        "CHATWOOT_SYNC: conv_id=%s etapa_antiga=%s etapa_nova=%s habilitado=%s",
+        chatwoot_conv_id, contexto.sessao.etapa_atual, envelope.etapa_atual,
+        chatwoot_sync._habilitado(),
+    )
     if chatwoot_conv_id:
         # Determinar etapa efetiva: se houve transicao valida usa a nova, senao a atual
         _etapa_antiga = contexto.sessao.etapa_atual
