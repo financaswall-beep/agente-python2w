@@ -15,3 +15,8 @@ MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "2"))
 
 # Quantos rounds de tool calls a IA pode fazer em um unico turno
 MAX_TOOL_ROUNDS: int = int(os.getenv("MAX_TOOL_ROUNDS", "5"))
+
+# --- Chatwoot (opcional -- agente funciona sem) ---
+CHATWOOT_BASE_URL: str = os.getenv("CHATWOOT_BASE_URL", "").rstrip("/")
+CHATWOOT_API_TOKEN: str = os.getenv("CHATWOOT_API_TOKEN", "")
+CHATWOOT_ACCOUNT_ID: str = os.getenv("CHATWOOT_ACCOUNT_ID", "1")

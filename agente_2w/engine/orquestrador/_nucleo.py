@@ -17,6 +17,7 @@ from agente_2w.engine.sessao_timeout import (
     SituacaoSessao,
     TIMEOUT_BLOQUEADA_HORAS,
     TIMEOUT_SESSAO_DIAS,
+    TIMEOUT_POS_PEDIDO_HORAS,
 )
 from agente_2w.engine.montador_contexto import montar_contexto
 from agente_2w.engine.maquina_estados import transicao_permitida, motivo_bloqueio, proximas_etapas
@@ -35,6 +36,7 @@ from agente_2w.enums.enums import (
     StatusItemProvisorio,
 )
 from agente_2w.constantes import ChaveContexto
+from agente_2w import chatwoot_sync
 from agente_2w.schemas.mensagem_chat import MensagemChatCreate
 from agente_2w.schemas.sessao_chat import SessaoChatCreate
 from agente_2w.schemas.contexto_conversa import ContextoConversaCreate
@@ -79,7 +81,11 @@ def _resolver_timeout(sessao) -> UUID:
     para nao interromper o atendimento.
     """
     try:
-        situacao = avaliar_sessao(sessao)
+        # Verificar se sessao tem pedido (necessario para timeout pos-pedido)
+        from agente_2w.db import pedido_repo
+        tem_pedido = pedido_repo.buscar_pedido_por_sessao(sessao.id) is not None
+
+        situacao = avaliar_sessao(sessao, tem_pedido=tem_pedido)
 
         if situacao == SituacaoSessao.ok:
             return sessao.id
@@ -91,6 +97,22 @@ def _resolver_timeout(sessao) -> UUID:
                 sessao.id, TIMEOUT_BLOQUEADA_HORAS,
             )
             return sessao.id
+
+        if situacao == SituacaoSessao.expirada_pos_pedido:
+            # Sessao com pedido criado expirou apos 48h — fechar e criar nova
+            sessao_repo.fechar_sessao(sessao.id)
+            nova = sessao_repo.criar_sessao(SessaoChatCreate(
+                canal=sessao.canal,
+                contato_externo=sessao.contato_externo,
+                etapa_atual=EtapaFluxo.identificacao,
+                status_sessao=StatusSessao.ativa,
+            ))
+            logger.info(
+                "Sessao %s (pos-pedido) encerrada por inatividade (%dh). "
+                "Nova sessao criada: %s",
+                sessao.id, TIMEOUT_POS_PEDIDO_HORAS, nova.id,
+            )
+            return nova.id
 
         # expirada_com_contexto ou expirada_sem_contexto
         sessao_repo.fechar_sessao(sessao.id)
@@ -229,6 +251,230 @@ def _persistir_pneus_encontrados(sessao_id: UUID, pneus: list[dict]) -> None:
         logger.exception("Erro ao persistir pneus encontrados")
 
 
+def _salvar_item_orfao_pre_busca(
+    sessao_id: UUID, contexto, envelope, novos_pneus: list[dict]
+) -> None:
+    """Safety net: antes de nova busca sobrescrever ultimos_pneus_encontrados,
+    verifica se havia pneu(s) nos resultados anteriores que a IA nao salvou.
+
+    Caso classico: cliente diz "serve sim, tem pra Fan tambem?" — a IA faz
+    nova busca (Fan) sem criar item para o pneu anterior (Twister).
+    Os resultados da Fan sobrescrevem os da Twister e ela se perde.
+
+    Condicoes (TODAS devem ser verdadeiras):
+    1. Nova busca retornou resultados (novos_pneus nao vazio)
+    2. Resultados anteriores tinham exatamente 1 pneu (sem ambiguidade)
+    3. Nenhum item_provisorio ativo com esse pneu_id na sessao
+    4. IA nao criou item para esse pneu_id em mudancas_itens deste turno
+    5. Nenhum sinal de rejeicao (fato ativo OU fato deste turno OU acao rejeitar/cancelar)
+    6. Etapa atual era oferta ou busca (cliente estava recebendo proposta)
+    """
+    if not novos_pneus:
+        return
+
+    # Condicao 6: so em oferta ou busca
+    etapa = contexto.sessao.etapa_atual
+    if etapa not in (EtapaFluxo.oferta, EtapaFluxo.busca):
+        return
+
+    # Buscar resultados anteriores no contexto
+    fato_pneus = contexto_repo.buscar_fato_ativo(
+        sessao_id, ChaveContexto.ULTIMOS_PNEUS_ENCONTRADOS
+    )
+    if not fato_pneus or not fato_pneus.valor_json:
+        return
+
+    pneus_antigos = [p for p in fato_pneus.valor_json if p.get("pneu_id")]
+
+    # Condicao 2: exatamente 1 pneu (sem ambiguidade de qual o cliente queria)
+    if len(pneus_antigos) != 1:
+        if len(pneus_antigos) > 1:
+            logger.debug(
+                "Safety net skip: %d pneus nos resultados anteriores (ambiguo)",
+                len(pneus_antigos),
+            )
+        return
+
+    pneu_antigo = pneus_antigos[0]
+    pneu_id_str = str(pneu_antigo["pneu_id"])
+
+    # Condicao 3: nenhum item ativo com esse pneu_id
+    itens_ativos = item_provisorio_repo.listar_itens_ativos_por_sessao(sessao_id)
+    if any(i.pneu_id and str(i.pneu_id) == pneu_id_str for i in itens_ativos):
+        return  # Ja existe — tudo ok
+
+    # Condicao 4: IA nao criou item para esse pneu neste turno
+    for m in envelope.mudancas_itens:
+        if m.acao == "criar" and m.dados and str(m.dados.get("pneu_id", "")) == pneu_id_str:
+            return  # IA tratou corretamente
+
+    # Condicao 5a: sem rejeicao no banco
+    fato_recusa = contexto_repo.buscar_fato_ativo(
+        sessao_id, ChaveContexto.CLIENTE_RECUSOU_OPCAO_ATUAL
+    )
+    if fato_recusa:
+        return
+
+    # Condicao 5b: sem rejeicao nos fatos DESTE turno (ainda nao persistidos)
+    for fato in envelope.fatos_observados:
+        if fato.chave == ChaveContexto.CLIENTE_RECUSOU_OPCAO_ATUAL:
+            return
+
+    # Condicao 5c: sem acao de rejeitar/cancelar item neste turno
+    for m in envelope.mudancas_itens:
+        if m.acao in ("rejeitar", "cancelar"):
+            return
+
+    # Todas as condicoes atendidas — criar item automaticamente
+    try:
+        pneu_uuid = UUID(pneu_id_str)
+    except (ValueError, AttributeError):
+        return
+
+    # Preco: primeiro tenta dos resultados, depois busca no DB
+    preco = None
+    if pneu_antigo.get("preco_venda"):
+        try:
+            preco = float(pneu_antigo["preco_venda"])
+        except (ValueError, TypeError):
+            pass
+    if preco is None:
+        try:
+            from agente_2w.db import catalogo_repo as _cat
+            estoque = _cat.buscar_estoque_por_pneu(pneu_uuid)
+            if estoque and estoque.preco_venda:
+                preco = float(estoque.preco_venda)
+        except Exception:
+            logger.exception("Safety net: falha ao buscar preco no DB para %s", pneu_uuid)
+
+    posicao = pneu_antigo.get("posicao")
+
+    item_provisorio_repo.criar_item(ItemProvisorioCreate(
+        sessao_chat_id=sessao_id,
+        status_item=StatusItemProvisorio.selecionado_cliente,
+        pneu_id=pneu_uuid,
+        posicao=posicao,
+        quantidade=1,
+        preco_unitario_sugerido=preco,
+    ))
+    logger.info(
+        "Safety net item-orfao: auto-criado pneu_id=%s (preco=%s, posicao=%s) "
+        "antes de nova busca sobrescrever resultados",
+        pneu_uuid, preco, posicao,
+    )
+
+
+def _salvar_itens_orfaos_pre_finalizacao(sessao_id: UUID) -> int:
+    """Safety net: antes de finalizar_itens ou converter_em_pedido, verifica se
+    ha pneus em ultimos_pneus_encontrados que o modelo nao salvou como item.
+
+    Caso classico: cliente confirma 3 pneus, IA diz "anotado os tres" mas so
+    emite 1 mudancas_itens:criar. Os outros 2 pneus ficam apenas no contexto
+    e o pedido fecha incompleto.
+
+    Retorna a quantidade de itens criados automaticamente.
+    """
+    fato_pneus = contexto_repo.buscar_fato_ativo(
+        sessao_id, ChaveContexto.ULTIMOS_PNEUS_ENCONTRADOS
+    )
+    if not fato_pneus or not fato_pneus.valor_json:
+        return 0
+
+    pneus_encontrados = [p for p in fato_pneus.valor_json if p.get("pneu_id")]
+    if not pneus_encontrados:
+        return 0
+
+    # Itens ativos na sessao — indexar por pneu_id para comparacao
+    itens_ativos = item_provisorio_repo.listar_itens_ativos_por_sessao(sessao_id)
+    pneu_ids_ja_salvos = {
+        str(i.pneu_id) for i in itens_ativos if i.pneu_id
+    }
+
+    # Pneus rejeitados/cancelados — nao recriar
+    pneu_ids_cancelados: set[str] = set()
+    for item in itens_ativos:
+        if item.pneu_id and item.status_item in (
+            StatusItemProvisorio.cancelado,
+            StatusItemProvisorio.rejeitado,
+        ):
+            pneu_ids_cancelados.add(str(item.pneu_id))
+
+    # Posicoes ja cobertas por itens salvos — evita criar pneu da mesma
+    # posicao que o cliente nao pediu (ex: busca trouxe 3 traseiros,
+    # cliente escolheu 1, safety net nao deve criar os outros 2).
+    posicoes_ja_cobertas: set[str] = set()
+    for item in itens_ativos:
+        if item.posicao and item.pneu_id and str(item.pneu_id) in pneu_ids_ja_salvos:
+            posicoes_ja_cobertas.add(item.posicao.lower().strip())
+
+    criados = 0
+    for pneu in pneus_encontrados:
+        pid = str(pneu["pneu_id"])
+        if pid in pneu_ids_ja_salvos:
+            continue
+        if pid in pneu_ids_cancelados:
+            continue
+
+        posicao = pneu.get("posicao")
+
+        # Filtro por posicao: se ja existe item salvo com mesma posicao,
+        # nao criar — provavelmente o cliente escolheu outro da mesma posicao.
+        if posicao and posicao.lower().strip() in posicoes_ja_cobertas:
+            logger.debug(
+                "Safety net finalizacao: pneu_id=%s ignorado (posicao '%s' ja coberta)",
+                pid, posicao,
+            )
+            continue
+
+        try:
+            pneu_uuid = UUID(pid)
+        except (ValueError, AttributeError):
+            continue
+
+        preco = None
+        if pneu.get("preco_venda"):
+            try:
+                preco = float(pneu["preco_venda"])
+            except (ValueError, TypeError):
+                pass
+        if preco is None:
+            try:
+                from agente_2w.db import catalogo_repo as _cat
+                estoque = _cat.buscar_estoque_por_pneu(pneu_uuid)
+                if estoque and estoque.preco_venda:
+                    preco = float(estoque.preco_venda)
+            except Exception:
+                logger.exception(
+                    "Safety net finalizacao: falha ao buscar preco para %s", pneu_uuid
+                )
+
+        try:
+            item_provisorio_repo.criar_item(ItemProvisorioCreate(
+                sessao_chat_id=sessao_id,
+                status_item=StatusItemProvisorio.selecionado_cliente,
+                pneu_id=pneu_uuid,
+                posicao=posicao,
+                quantidade=1,
+                preco_unitario_sugerido=preco,
+            ))
+            criados += 1
+            logger.info(
+                "Safety net finalizacao: auto-criado pneu_id=%s (preco=%s, posicao=%s)",
+                pneu_uuid, preco, posicao,
+            )
+        except Exception:
+            logger.exception(
+                "Safety net finalizacao: falha ao criar item pneu_id=%s", pneu_uuid
+            )
+
+    if criados:
+        logger.info(
+            "Safety net finalizacao: %d item(ns) orfao(s) criado(s) antes de finalizar",
+            criados,
+        )
+    return criados
+
+
 def _atualizar_nome_cliente(sessao_id: UUID, cliente_id) -> None:
     """Se nome_cliente foi registrado nos fatos e o cliente ainda nao tem nome, persiste."""
     try:
@@ -338,6 +584,12 @@ def _despachar_acoes(sessao_id: UUID, acoes: list[str]):
     Retorna o Pedido criado se converter_em_pedido foi executado, None caso contrario.
     """
     pedido_criado = None
+
+    # Safety net: garantir que todos os pneus confirmados viraram item
+    # antes de finalizar ou converter em pedido.
+    if "finalizar_itens" in acoes or "converter_em_pedido" in acoes:
+        _salvar_itens_orfaos_pre_finalizacao(sessao_id)
+
     for acao in acoes:
         if acao == "converter_em_pedido":
             try:
@@ -414,6 +666,54 @@ def _despachar_acoes(sessao_id: UUID, acoes: list[str]):
     return pedido_criado
 
 
+# Fatos de busca que devem ser limpos quando a conversa reinicia do zero.
+# Evita que dados de uma moto/pneu antigos contaminem a nova conversa.
+_FATOS_BUSCA_CONTEXTO = [
+    ChaveContexto.ULTIMOS_PNEUS_ENCONTRADOS,
+    ChaveContexto.MEDIDA_INFORMADA,
+    ChaveContexto.POSICAO_PNEU,
+    ChaveContexto.MOTO_MODELO,
+    ChaveContexto.MOTO_MARCA,
+    ChaveContexto.MOTO_ANO,
+    ChaveContexto.SEM_PREFERENCIA_MARCA,
+    ChaveContexto.CLIENTE_RECUSOU_OPCAO_ATUAL,
+    ChaveContexto.ITENS_FINALIZADOS,
+]
+
+
+def _limpar_contexto_busca(sessao_id: UUID) -> None:
+    """Desativa fatos de busca da conversa anterior e cancela itens orfaos.
+
+    Chamado quando a IA regressa para 'identificacao' — sinaliza nova conversa
+    dentro da mesma sessao (cliente voltou a cumprimentar ou mudou de assunto).
+    Sem isso, moto_modelo/posicao/pneus antigos contaminam a nova busca,
+    e itens provisorios de compras anteriores sao promovidos indevidamente.
+    """
+    for chave in _FATOS_BUSCA_CONTEXTO:
+        try:
+            contexto_repo.desativar_fato_anterior(sessao_id, chave)
+        except Exception:
+            logger.exception("Falha ao limpar fato '%s' no reset para identificacao", chave)
+
+    # Cancelar itens provisorios orfaos da conversa anterior.
+    # Voltar para identificacao = nova compra; itens antigos nao devem ser promovidos.
+    try:
+        itens_ativos = item_provisorio_repo.listar_itens_ativos_por_sessao(sessao_id)
+        for item in itens_ativos:
+            item_provisorio_repo.atualizar_status_item(
+                item.id, StatusItemProvisorio.cancelado,
+            )
+        if itens_ativos:
+            logger.info(
+                "Itens orfaos cancelados ao regredir para identificacao: sessao=%s, qtd=%d",
+                sessao_id, len(itens_ativos),
+            )
+    except Exception:
+        logger.exception("Falha ao cancelar itens orfaos na sessao %s", sessao_id)
+
+    logger.info("Contexto de busca limpo: sessao=%s regressou para identificacao", sessao_id)
+
+
 def _avaliar_transicao(sessao_id: UUID, etapa_atual, etapa_proposta) -> None:
     """Avalia e aplica transicao de etapa, ou registra bloqueio."""
     if etapa_proposta == etapa_atual:
@@ -422,6 +722,10 @@ def _avaliar_transicao(sessao_id: UUID, etapa_atual, etapa_proposta) -> None:
     if transicao_permitida(etapa_atual, etapa_proposta):
         sessao_repo.atualizar_etapa(sessao_id, etapa_proposta)
         logger.info("Etapa: %s -> %s", etapa_atual.value, etapa_proposta.value)
+        # Limpar contexto de busca quando regride para identificacao.
+        # Evita que moto/pneu da conversa anterior contaminem a nova.
+        if etapa_proposta == EtapaFluxo.identificacao:
+            _limpar_contexto_busca(sessao_id)
     else:
         motivo = motivo_bloqueio(etapa_atual, etapa_proposta)
         sessao_repo.atualizar_status(
@@ -455,6 +759,8 @@ def processar_turno(
     criado_em: datetime | None = None,
     message_id_externo: str | None = None,
     imagens: list[str] | None = None,
+    chatwoot_conv_id: int | None = None,
+    chatwoot_contact_id: int | None = None,
 ) -> RespostaTurno:
     """Processa um turno completo da conversa.
 
@@ -495,6 +801,8 @@ def processar_turno(
             cliente = cliente_repo.resolver_ou_criar_cliente(sessao.contato_externo)
             sessao_repo.vincular_cliente(sessao_id, cliente.id)
             logger.info("Cliente resolvido: %s", cliente.id)
+            if chatwoot_contact_id:
+                chatwoot_sync.sincronizar_custom_attributes(chatwoot_contact_id, cliente)
         except Exception:
             logger.exception("Falha ao resolver cliente")
 
@@ -520,6 +828,8 @@ def processar_turno(
             "pneus coletados das tools: %s",
             [p["pneu_id"] for p in pneus_encontrados],
         )
+        # Safety net: salvar item orfao antes que nova busca sobrescreva
+        _salvar_item_orfao_pre_busca(sessao_id, contexto, envelope, pneus_encontrados)
         # Persistir no contexto para turnos seguintes (ex: oferta sem tool call)
         _persistir_pneus_encontrados(sessao_id, pneus_encontrados)
     else:
@@ -541,10 +851,15 @@ def processar_turno(
     # --- 7. Aplicar fatos inferidos ---
     _aplicar_fatos_inferidos(sessao_id, envelope.fatos_inferidos)
 
-    # --- 7b. Persistir nome do cliente se foi registrado neste turno ---
+    # --- 7b. Persistir nome e localidade do cliente se registrados neste turno ---
     sessao_apos_fatos = sessao_repo.buscar_sessao_por_id(sessao_id)
     if sessao_apos_fatos and sessao_apos_fatos.cliente_id:
         _atualizar_nome_cliente(sessao_id, sessao_apos_fatos.cliente_id)
+        _atualizar_localidade_cliente(sessao_id, sessao_apos_fatos.cliente_id)
+        if chatwoot_contact_id:
+            _fato_nome = contexto_repo.buscar_fato_ativo(sessao_id, ChaveContexto.NOME_CLIENTE)
+            if _fato_nome and _fato_nome.valor_texto:
+                chatwoot_sync.sincronizar_nome_cliente(chatwoot_contact_id, _fato_nome.valor_texto)
 
     # --- 7c. Cancelamento solicitado via fato ---
     fato_cancel = contexto_repo.buscar_fato_ativo(sessao_id, ChaveContexto.PEDIDO_CANCELAMENTO_SOLICITADO)
@@ -625,9 +940,56 @@ def processar_turno(
 
     # --- 10. Despachar acoes sugeridas ---
     pedido_criado = _despachar_acoes(sessao_id, envelope.acoes_sugeridas)
+    if chatwoot_conv_id and pedido_criado:
+        chatwoot_sync.sincronizar_pedido_criado(
+            chatwoot_conv_id, pedido_criado.numero_pedido, pedido_criado.valor_total,
+        )
+
+    # --- 10b. Layer 2: detectar nova intencao de compra pos-pedido ---
+    # Se a sessao esta em fechamento com pedido criado e a IA emitiu acao
+    # de busca (buscar_por_moto/buscar_por_medida), o cliente quer comprar
+    # de novo. Fechar sessao atual e criar nova para a nova compra.
+    _ACOES_BUSCA = {"buscar_por_moto", "buscar_por_medida"}
+    _acoes_set = set(envelope.acoes_sugeridas)
+    if (
+        contexto.sessao.etapa_atual == EtapaFluxo.fechamento
+        and _acoes_set & _ACOES_BUSCA
+        and not pedido_criado
+    ):
+        from agente_2w.db import pedido_repo as _ped_repo
+        pedido_existente = _ped_repo.buscar_pedido_por_sessao(sessao_id)
+        if pedido_existente:
+            logger.info(
+                "Layer 2: nova intencao de compra detectada (acoes=%s) em sessao %s "
+                "com pedido #%s. Fechando sessao e criando nova.",
+                _acoes_set & _ACOES_BUSCA, sessao_id, pedido_existente.numero_pedido,
+            )
+            sessao_repo.fechar_sessao(sessao_id)
+            nova_sessao = sessao_repo.criar_sessao(SessaoChatCreate(
+                canal=sessao_pre.canal,
+                contato_externo=sessao_pre.contato_externo,
+                etapa_atual=EtapaFluxo.identificacao,
+                status_sessao=StatusSessao.ativa,
+            ))
+            # Vincular mesmo cliente
+            if sessao_pre.cliente_id:
+                sessao_repo.vincular_cliente(nova_sessao.id, sessao_pre.cliente_id)
+            logger.info("Layer 2: nova sessao %s criada. Reprocessando mensagem.", nova_sessao.id)
+            # Reprocessar a mensagem na nova sessao (recursao controlada — 1 nivel)
+            return processar_turno(
+                nova_sessao.id,
+                mensagem_texto,
+                criado_em=criado_em,
+                message_id_externo=message_id_externo,
+                imagens=imagens,
+                chatwoot_conv_id=chatwoot_conv_id,
+                chatwoot_contact_id=chatwoot_contact_id,
+            )
 
     # --- 11. Avaliar transicao de etapa ---
     _avaliar_transicao(sessao_id, contexto.sessao.etapa_atual, envelope.etapa_atual)
+    if chatwoot_conv_id and envelope.etapa_atual != contexto.sessao.etapa_atual:
+        chatwoot_sync.sincronizar_etapa(chatwoot_conv_id, envelope.etapa_atual.value)
 
     # --- 12. Auto-promover em fechamento se pre-condicoes ok ---
     # Se a etapa resultante e fechamento e o promotor nao foi chamado
@@ -637,12 +999,18 @@ def processar_turno(
     if etapa_resultante.value == "fechamento" and not ja_tentou_promover:
         erros_pre = validar_pre_condicoes(sessao_id)
         if not erros_pre:
+            # Safety net: garantir itens orfaos antes de promover automaticamente
+            _salvar_itens_orfaos_pre_finalizacao(sessao_id)
             try:
                 pedido_criado = promover_para_pedido(sessao_id)
                 logger.info(
                     "Auto-promocao em fechamento: pedido #%s (valor=%s)",
                     pedido_criado.numero_pedido, pedido_criado.valor_total,
                 )
+                if chatwoot_conv_id:
+                    chatwoot_sync.sincronizar_pedido_criado(
+                        chatwoot_conv_id, pedido_criado.numero_pedido, pedido_criado.valor_total,
+                    )
                 sessao_atual = sessao_repo.buscar_sessao_por_id(sessao_id)
                 if sessao_atual and sessao_atual.cliente_id:
                     _atualizar_localidade_cliente(sessao_id, sessao_atual.cliente_id)

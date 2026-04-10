@@ -300,6 +300,7 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
     inbox_id = conversation.get("inbox_id") or data.get("inbox", {}).get("id")
     sender = data.get("sender", {})
     sender_meta = conversation.get("meta", {}).get("sender", {})
+    chatwoot_contact_id = sender_meta.get("id") or sender.get("id")
 
     # 6. Gerar message_id robusto
     raw_id = data.get("id")
@@ -379,6 +380,8 @@ async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
                 content,
                 message_id_externo=message_id,
                 imagens=imagens or None,
+                chatwoot_conv_id=conversation_id,
+                chatwoot_contact_id=chatwoot_contact_id,
             )
 
             # Enviar texto
