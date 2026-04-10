@@ -194,8 +194,34 @@ async def _enviar_mensagem_chatwoot(conversation_id: int, texto: str) -> None:
 
 
 async def _enviar_foto_chatwoot(conversation_id: int, foto_url: str) -> None:
-    """Envia foto como mensagem no Chatwoot (URL como texto)."""
-    await _enviar_mensagem_chatwoot(conversation_id, foto_url)
+    """Baixa imagem pela URL e envia como attachment no Chatwoot."""
+    url = (
+        f"{CHATWOOT_BASE_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}"
+        f"/conversations/{conversation_id}/messages"
+    )
+    headers = {"api_access_token": CHATWOOT_API_TOKEN}
+    try:
+        img_resp = await _http.get(foto_url, timeout=15.0)
+        img_resp.raise_for_status()
+    except Exception as e:
+        logger.error("Falha ao baixar foto %s: %s", foto_url, e)
+        return
+
+    content_type = img_resp.headers.get("content-type", "image/webp")
+    ext = content_type.split("/")[-1].split(";")[0]
+    filename = f"pneu.{ext}"
+
+    try:
+        resp = await _http.post(
+            url,
+            headers=headers,
+            data={"content": "", "message_type": "outgoing", "private": "false"},
+            files={"attachments[]": (filename, img_resp.content, content_type)},
+        )
+        resp.raise_for_status()
+        logger.info("Foto enviada: conv=%s url=%s", conversation_id, foto_url[:60])
+    except Exception as e:
+        logger.error("Falha ao enviar foto para Chatwoot: %s", e)
 
 
 # ---------------------------------------------------------------------------
