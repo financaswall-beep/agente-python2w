@@ -742,8 +742,9 @@ def _avaliar_transicao(sessao_id: UUID, etapa_atual, etapa_proposta) -> None:
 import re as _re
 
 _REGEX_PEDIU_FOTO = _re.compile(
-    r"(?:foto|imagem|ver o pneu|ver ele|mostra|como .{0,6} pneu|manda.{0,6}foto|quero ver|"
-    r"tem como ver|deixa eu ver|me mostra|posso ver)",
+    r"(?:fot[oa]|fotinha|imagem|ver o pneu|ver ele|mostra|como .{0,6} pneu|"
+    r"manda.{0,10}foto|quero ver|tem como ver|deixa eu ver|me mostra|posso ver|"
+    r"manda de novo|nao vi|n[aã]o apareceu|cadê a foto|cade a foto|manda a[ií])",
     _re.IGNORECASE,
 )
 
