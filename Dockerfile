@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Cache-bust: mude este valor para forcar rebuild
+ARG CACHEBUST=2026-04-10a
+
 # Codigo do projeto
 COPY agente_2w/ ./agente_2w/
 COPY webhook_server.py .
