@@ -288,6 +288,12 @@ async def health():
         raise HTTPException(status_code=503, detail="Supabase indisponivel")
 
 
+@app.get("/version")
+async def version():
+    """Retorna versao do codigo deployado."""
+    return {"version": "2026-04-11a", "chatwoot_conv_id_fix": True}
+
+
 @app.post("/webhook/chatwoot")
 async def chatwoot_webhook(request: Request, background_tasks: BackgroundTasks):
     """Recebe webhooks do Chatwoot para mensagens recebidas."""
